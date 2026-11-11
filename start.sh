@@ -2,16 +2,7 @@
 set -euo pipefail
 
 # SixteenGigsOfVibes — local llama.cpp (GGUF) server for 16 GB RAM/VRAM machines.
-#
-# Order of operations: preflight -> backend detection -> image pull -> model
-# download (resumable, SHA256SUMS-verified) -> container start -> wait for
-# /health -> endpoint info. The script is idempotent: re-running skips the
-# download and reports "already running".
-#
-# Variable precedence (highest first):
-#   1. variables exported in the shell
-#   2. entries in ./.env
-#   3. inline defaults below / presets defined for MODEL
+# Cross-platform compatible (macOS & Linux).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "${SCRIPT_DIR}/.env" ]]; then
@@ -26,15 +17,13 @@ if [[ -f "${SCRIPT_DIR}/.env" ]]; then
 fi
 
 # ---- model preset ------------------------------------------------------------
-# Each preset is a complete set: HF repo, GGUF file, model alias (the name
-# shown in /v1/models), an optional vision projector and a default context.
 MODEL="${MODEL:-qwen38}"
 case "${MODEL}" in
   qwen38)
     PRESET_REPO="empero-ai/Qwen3.8-9B-Distill-GGUF"
     PRESET_FILE="Qwen3.8-9B-Q4_K_M.gguf"
     PRESET_ALIAS="qwen3.8-9b-distill-q4_k_m"
-    PRESET_MMPROJ=""                     # repo has no vision projector
+    PRESET_MMPROJ=""
     PRESET_CTX=32768
     PRESET_NEED_GIB=8
     ;;
@@ -53,7 +42,7 @@ case "${MODEL}" in
     PRESET_MMPROJ="Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
     PRESET_CTX=16384
     PRESET_NEED_GIB=10
-    PRESET_KV="q8_0"                     # 27B: KV in q8_0 fits in 16 GB
+    PRESET_KV="q8_0"
     ;;
   *)
     echo "ERROR: unknown MODEL='${MODEL}' (allowed: qwen38 | ornith | bonsai27)"
@@ -61,8 +50,6 @@ case "${MODEL}" in
     ;;
 esac
 
-# Only when the variable is not set in .env/shell — the loader skips empty
-# values in .env, so "defined but empty" is respected here as well.
 HF_REPO="${HF_REPO-${PRESET_REPO}}"
 HF_FILE="${HF_FILE-${PRESET_FILE}}"
 MODEL_ALIAS="${MODEL_ALIAS-${PRESET_ALIAS}}"
@@ -70,12 +57,12 @@ MMPROJ="${MMPROJ-${PRESET_MMPROJ}}"
 CTX_SIZE="${CTX_SIZE:-${PRESET_CTX}}"
 KV_CACHE_TYPE="${KV_CACHE_TYPE-${PRESET_KV:-}}"
 
-HF_REVISION="${HF_REVISION:-}"            # empty = main; provide a SHA for reproducibility
-VISION="${VISION:-}"                      # non-empty + MMPROJ -> --mmproj
-PARALLEL="${PARALLEL:-1}"                 # number of slots; context is split between them
-BACKEND="${BACKEND:-auto}"                # auto | cuda | rocm | vulkan | cpu
+HF_REVISION="${HF_REVISION:-}"
+VISION="${VISION:-}"
+PARALLEL="${PARALLEL:-1}"
+BACKEND="${BACKEND:-auto}"
 CONTAINER_NAME="${CONTAINER_NAME:-SixteenGigsOfVibes-llama}"
-PORT="${PORT:-8080}"                      # host port; container listens on 8080
+PORT="${PORT:-8080}"
 MODEL_DIR="${MODEL_DIR:-${SCRIPT_DIR}/models}"
 LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/.SixteenGigsOfVibes.log}"
 READY_TIMEOUT="${READY_TIMEOUT:-600}"
@@ -90,6 +77,7 @@ resolve_path() {
 }
 MODEL_DIR="$(resolve_path "${MODEL_DIR}")"
 LOG_FILE="$(resolve_path "${LOG_FILE}")"
+touch "${LOG_FILE}"
 
 # ---- preflight ---------------------------------------------------------------
 command -v podman >/dev/null 2>&1 || { echo "podman is not on PATH"; exit 1; }
@@ -115,7 +103,6 @@ DEV_ARGS=()
 GPU_LAYERS=()
 case "${BACKEND}" in
   cuda)
-    # Requires nvidia-container-toolkit (CDI) on the host — see README.
     DEV_ARGS=(--gpus all --ulimit memlock=-1:-1 --ipc host)
     GPU_LAYERS=(--n-gpu-layers 99)
     ;;
@@ -171,10 +158,10 @@ download_file() {
   local attempt=1 rc=0
   while true; do
     if command -v hf >/dev/null 2>&1; then
-      if hf download "${repo}" "${file}" "${rev_args[@]}" --local-dir "${MODEL_DIR}"; then
+      if hf download "${repo}" "${file}" "${rev_args[@]+"${rev_args[@]}"}" --local-dir "${MODEL_DIR}"; then
         return 0
       else
-        rc=$?    # in the else branch $? is the exit code of the failed hf download
+        rc=$?
       fi
     elif python3 -c "import huggingface_hub" 2>/dev/null; then
       if HF_REPO_ENV="${repo}" HF_FILE_ENV="${file}" HF_REVISION_ENV="${HF_REVISION}" \
@@ -191,7 +178,7 @@ PY
       then
         return 0
       else
-        rc=$?    # same — exit code of the failed hf_hub_download
+        rc=$?
       fi
     else
       echo "ERROR: neither 'hf' nor 'huggingface_hub' is available on the host."
@@ -213,7 +200,7 @@ fetch_sums() {
   local url="https://huggingface.co/${HF_REPO}/raw/${HF_REVISION:-main}/SHA256SUMS"
   local hdr=()
   [[ -n "${HF_TOKEN:-}" ]] && hdr=(-H "Authorization: Bearer ${HF_TOKEN}")
-  if curl -fsSL "${hdr[@]}" "${url}" -o "${MODEL_DIR}/SHA256SUMS.tmp" 2>/dev/null; then
+  if curl -fsSL "${hdr[@]+"${hdr[@]}"}" "${url}" -o "${MODEL_DIR}/SHA256SUMS.tmp" 2>/dev/null; then
     mv "${MODEL_DIR}/SHA256SUMS.tmp" "${MODEL_DIR}/SHA256SUMS"
   else
     rm -f "${MODEL_DIR}/SHA256SUMS.tmp"
@@ -306,21 +293,19 @@ SERVE_ARGS=(
 )
 [[ -n "${KV_CACHE_TYPE}" ]] && SERVE_ARGS+=(-ctk "${KV_CACHE_TYPE}" -ctv "${KV_CACHE_TYPE}")
 [[ -n "${WANT_MMPROJ}" ]] && SERVE_ARGS+=(--mmproj "/models/${WANT_MMPROJ}")
-SERVE_ARGS+=("${GPU_LAYERS[@]}")
+SERVE_ARGS+=("${GPU_LAYERS[@]+"${GPU_LAYERS[@]}"}")
 
-# --ipc host is mandatory for ROCm; :z relabels the bind for SELinux.
-# The llama.cpp image entrypoint is the llama-server binary itself, so the
-# arguments are passed directly after the image name.
 EXTRA_ARGS=()
 [[ -n "${PODMAN_EXTRA_ARGS}" ]] && read -r -a EXTRA_ARGS <<< "${PODMAN_EXTRA_ARGS}"
+
 podman run -d \
   --name "${CONTAINER_NAME}" \
-  "${DEV_ARGS[@]}" \
+  "${DEV_ARGS[@]+"${DEV_ARGS[@]}"}" \
   -p "${PORT}:8080" \
   -v "${MODEL_DIR}:/models:ro,z" \
-  "${EXTRA_ARGS[@]}" \
+  "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" \
   "${IMAGE}" \
-  "${SERVE_ARGS[@]}" \
+  "${SERVE_ARGS[@]+"${SERVE_ARGS[@]}"}" \
   >/dev/null
 
 echo "Spawned container ${CONTAINER_NAME}"
@@ -329,16 +314,17 @@ echo "Spawned container ${CONTAINER_NAME}"
 log_follow_pid=""
 cleanup() {
   if [[ -n "${log_follow_pid}" ]]; then
-    # setsid runs the pipe in its own process group — the signal must hit the
-    # whole group, otherwise `podman logs -f` survives and the wait below hangs the script.
-    kill -- "-${log_follow_pid}" 2>/dev/null \
-      || kill "${log_follow_pid}" 2>/dev/null || true
+    kill "${log_follow_pid}" 2>/dev/null || true
     wait "${log_follow_pid}" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
 
-setsid bash -c 'podman logs -f "$1" 2>&1 | tee -a "$2"' _ "${CONTAINER_NAME}" "${LOG_FILE}" &
+# Portable background log tailer (works on macOS and Linux)
+(
+  exec >/dev/null 2>&1
+  podman logs -f "${CONTAINER_NAME}" 2>&1 | tee -a "${LOG_FILE}"
+) &
 log_follow_pid=$!
 
 READY_URL="http://127.0.0.1:${PORT}/health"
