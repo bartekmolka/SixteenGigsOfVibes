@@ -1,0 +1,16 @@
+# Secrets — copy .env.sample to .env locally; never commit it
+.env
+
+# Model GGUF files (downloaded by start.sh, mounted read-only)
+models/
+
+# Server log
+*.log
+
+# Editor / OS clutter
+.DS_Store
+Thumbs.db
+*.swp
+*~
+__pycache__/
+*.pyc
